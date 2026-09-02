@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SIH26104 — Voice Clone Detection Gateway</title>
+  <meta name="description" content="Real-time voice clone impersonation detection dashboard for banking call security." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    /* ===== Reset & Root ===== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-primary: #0a0e1a;
+      --bg-secondary: #111827;
+      --bg-card: rgba(17, 24, 39, 0.7);
+      --bg-card-hover: rgba(30, 41, 59, 0.8);
+      --border: rgba(99, 102, 241, 0.15);
+      --border-active: rgba(99, 102, 241, 0.4);
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent: #6366f1;
+      --accent-glow: rgba(99, 102, 241, 0.25);
+      --safe: #10b981;
+      --safe-glow: rgba(16, 185, 129, 0.2);
+      --warning: #f59e0b;
+      --warning-glow: rgba(245, 158, 11, 0.2);
+      --critical: #ef4444;
+      --critical-glow: rgba(239, 68, 68, 0.2);
+      --low-conf: #8b5cf6;
+      --radius: 16px;
+      --radius-sm: 10px;
+      --radius-xs: 6px;
+      --shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ===== Animated background ===== */
+    body::before {
+      content: '';
+      position: fixed;
+      top: -50%; left: -50%;
+      width: 200%; height: 200%;
+      background: radial-gradient(ellipse at 30% 20%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
+                  radial-gradient(ellipse at 70% 80%, rgba(139, 92, 246, 0.06) 0%, transparent 50%),
+                  radial-gradient(ellipse at 50% 50%, rgba(16, 185, 129, 0.04) 0%, transparent 60%);
+      animation: bgShift 20s ease-in-out infinite alternate;
+      z-index: 0;
+      pointer-events: none;
+    }
+    @keyframes bgShift {
+      0% { transform: translate(0, 0) rotate(0deg); }
+      100% { transform: translate(-3%, 3%) rotate(2deg); }
+    }
+
+    /* ===== Layout ===== */
+    .app-wrapper {
+      position: relative;
+      z-index: 1;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px 28px 40px;
+    }
+
+    /* ===== Header ===== */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .logo-group {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .logo-icon {
+      width: 46px; height: 46px;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px;
+      box-shadow: 0 4px 20px var(--accent-glow);
+    }
+    .logo-text h1 {
+      font-size: 1.3rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #f1f5f9, #c7d2fe);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .logo-text span {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-weight: 400;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .header-badge {
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 20px;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    /* ===== Cards ===== */
+    .card {
+      background: var(--bg-card);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 24px;
+      transition: border-color var(--transition), box-shadow var(--transition);
+    }
+    .card:hover {
+      border-color: var(--border-active);
+    }
+    .card-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-title .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+    /* ===== Grid ===== */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 320px 1fr 300px;
+      gap: 20px;
+    }
+    @media (max-width: 1100px) {
+      .main-grid { grid-template-columns: 1fr 1fr; }
+      .main-grid > .col-right { grid-column: 1 / -1; }
+    }
+    @media (max-width: 700px) {
+      .main-grid { grid-template-columns: 1fr; }
+    }
+
+    .col-left { display: flex; flex-direction: column; gap: 20px; }
+    .col-center { display: flex; flex-direction: column; gap: 20px; }
+    .col-right { display: flex; flex-direction: column; gap: 20px; }
+
+    /* ===== Controls Card ===== */
+    .controls-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      font-family: 'Inter', sans-serif;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 11px 20px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all var(--transition);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      outline: none;
+      flex: 1;
+      justify-content: center;
+      min-width: 120px;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #818cf8);
+      color: white;
+      border-color: transparent;
+      box-shadow: 0 4px 16px var(--accent-glow);
+    }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 24px var(--accent-glow); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.12);
+      color: var(--critical);
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+    .btn-danger:hover { background: rgba(239, 68, 68, 0.2); }
+    .btn-secondary {
+      background: rgba(99, 102, 241, 0.08);
+      color: var(--text-secondary);
+      border-color: var(--border);
+    }
+    .btn-secondary:hover { background: rgba(99, 102, 241, 0.14); color: var(--text-primary); }
+
+    .btn .icon { font-size: 1rem; }
+
+    .file-input-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 120px;
+    }
+    .file-input-wrap input[type="file"] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    /* ===== Gauge ===== */
+    .gauge-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px 0 8px;
+    }
+    .gauge-svg {
+      width: 240px;
+      height: 140px;
+    }
+    .gauge-arc-bg {
+      fill: none;
+      stroke: rgba(100, 116, 139, 0.12);
+      stroke-width: 16;
+      stroke-linecap: round;
+    }
+    .gauge-arc-fill {
+      fill: none;
+      stroke-width: 16;
+      stroke-linecap: round;
+      transition: stroke-dashoffset 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+                  stroke 0.5s ease;
+      filter: drop-shadow(0 0 8px var(--safe-glow));
+    }
+    .gauge-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 2.4rem;
+      font-weight: 700;
+      fill: var(--text-primary);
+      text-anchor: middle;
+    }
+    .gauge-label {
+      font-size: 0.65rem;
+      fill: var(--text-muted);
+      text-anchor: middle;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .risk-badge {
+      margin-top: 14px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      padding: 8px 24px;
+      border-radius: 20px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      transition: all var(--transition);
+    }
+    .risk-SAFE { background: var(--safe-glow); color: var(--safe); border: 1px solid rgba(16,185,129,0.3); }
+    .risk-WARNING { background: var(--warning-glow); color: var(--warning); border: 1px solid rgba(245,158,11,0.3); }
+    .risk-CRITICAL { background: var(--critical-glow); color: var(--critical); border: 1px solid rgba(239,68,68,0.3); animation: criticalPulse 1s ease-in-out infinite; }
+    .risk-LOW_CONFIDENCE { background: rgba(139,92,246,0.15); color: var(--low-conf); border: 1px solid rgba(139,92,246,0.3); }
+    .risk-IDLE { background: rgba(100,116,139,0.12); color: var(--text-muted); border: 1px solid var(--border); }
+
+    @keyframes criticalPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); } 50% { box-shadow: 0 0 0 8px rgba(239,68,68,0.12); } }
+
+    /* ===== Metrics grid ===== */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .metric-box {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 14px 16px;
+      transition: border-color var(--transition);
+    }
+    .metric-box:hover { border-color: var(--border-active); }
+    .metric-label {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+    .metric-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.2rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    /* ===== Event Log ===== */
+    .event-log {
+      flex: 1;
+      min-height: 300px;
+      max-height: 520px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding-right: 4px;
+    }
+    .event-log::-webkit-scrollbar { width: 4px; }
+    .event-log::-webkit-scrollbar-track { background: transparent; }
+    .event-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .event-item {
+      font-size: 0.75rem;
+      padding: 10px 14px;
+      border-radius: var(--radius-xs);
+      background: rgba(15, 23, 42, 0.5);
+      border-left: 3px solid var(--border);
+      animation: slideIn 0.25s ease-out;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+
+    .event-item.ev-risk_update { border-left-color: var(--accent); }
+    .event-item.ev-liveness_challenge { border-left-color: var(--warning); }
+    .event-item.ev-enforcement_action { border-left-color: var(--critical); }
+    .event-item.ev-liveness_result { border-left-color: var(--low-conf); }
+    .event-item.ev-session_started { border-left-color: var(--safe); }
+    .event-item.ev-system { border-left-color: var(--text-muted); }
+
+    .event-type {
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.68rem;
+      color: var(--text-secondary);
+    }
+    .event-detail {
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.66rem;
+      line-height: 1.5;
+      word-break: break-all;
+    }
+
+    /* ===== Session info ===== */
+    .session-info-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .session-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .session-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .session-key {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .session-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+    }
+    .status-dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    .status-dot.connected { background: var(--safe); box-shadow: 0 0 8px var(--safe-glow); }
+    .status-dot.disconnected { background: var(--text-muted); }
+    .status-dot.recording { background: var(--critical); animation: pulse 1s infinite; }
+
+    /* ===== Waveform ===== */
+    .waveform-canvas {
+      width: 100%;
+      height: 80px;
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.5);
+      border: 1px solid var(--border);
+    }
+
+    /* ===== Empty state ===== */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+      color: var(--text-muted);
+      text-align: center;
+      gap: 12px;
+    }
+    .empty-state .icon { font-size: 2.4rem; opacity: 0.4; }
+    .empty-state p { font-size: 0.82rem; line-height: 1.6; max-width: 280px; }
+
+    /* ===== Footer ===== */
+    footer {
+      text-align: center;
+      margin-top: 32px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      letter-spacing: 0.02em;
+    }
+  </style>
+</head>
+<body>
+  <div class="app-wrapper">
+    <!-- Header -->
+    <header>
+      <div class="logo-group">
+        <div class="logo-icon">🛡️</div>
+        <div class="logo-text">
+          <h1>Voice Clone Detection</h1>
+          <span>SIH26104 — Real-Time Streaming Gateway</span>
+        </div>
+      </div>
+      <div class="header-badge" id="headerBadge">Disconnected</div>
+    </header>
+
+    <!-- Main Grid -->
+    <div class="main-grid">
+      <!-- Left Column -->
+      <div class="col-left">
+        <!-- Controls -->
+        <div class="card" id="controlsCard">
+          <div class="card-title"><span class="dot"></span> Audio Source</div>
+          <div class="controls-row" style="margin-bottom: 10px;">
+            <button class="btn btn-primary" id="btnMic" onclick="toggleMic()">
+              <span class="icon">🎙️</span> Start Mic
+            </button>
+            <button class="btn btn-danger" id="btnStop" onclick="stopStream()" style="display:none;">
+              <span class="icon">⏹</span> Stop
+            </button>
+          </div>
+          <div class="controls-row">
+            <div class="file-input-wrap">
+              <button class="btn btn-secondary" id="btnFileLabel">
+                <span class="icon">📁</span> Upload WAV
+              </button>
+              <input type="file" id="fileInput" accept=".wav,audio/wav" onchange="handleFile(event)" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Waveform -->
+        <div class="card">
+          <div class="card-title"><span class="dot"></span> Audio Waveform</div>
+          <canvas class="waveform-canvas" id="waveformCanvas"></canvas>
+        </div>
+
+        <!-- Session Info -->
+        <div class="card">
+          <div class="card-title"><span class="dot"></span> Session</div>
+          <div class="session-info-list">
+            <div class="session-row">
+              <span class="session-key">Status</span>
+              <span class="session-val" id="sessionStatus"><span class="status-dot disconnected"></span>Idle</span>
+            </div>
+            <div class="session-row">
+              <span class="session-key">Session ID</span>
+              <span class="session-val" id="sessionId">—</span>
+            </div>
+            <div class="session-row">
+              <span class="session-key">Model</span>
+              <span class="session-val" id="modelInfo">—</span>
+            </div>
+            <div class="session-row">
+              <span class="session-key">Strides</span>
+              <span class="session-val" id="strideCount">0</span>
+            </div>
+            <div class="session-row">
+              <span class="session-key">Source</span>
+              <span class="session-val" id="audioSource">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Center Column -->
+      <div class="col-center">
+        <!-- Gauge -->
+        <div class="card">
+          <div class="card-title"><span class="dot"></span> Composite Risk Score</div>
+          <div class="gauge-wrapper">
+            <svg class="gauge-svg" viewBox="0 0 240 140">
+              <!-- Background arc -->
+              <path class="gauge-arc-bg"
+                d="M 28 130 A 92 92 0 0 1 212 130" />
+              <!-- Colored fill arc -->
+              <path class="gauge-arc-fill" id="gaugeArc"
+                d="M 28 130 A 92 92 0 0 1 212 130"
+                stroke="var(--safe)"
+                stroke-dasharray="289"
+                stroke-dashoffset="289" />
+              <!-- Value text -->
+              <text class="gauge-value" x="120" y="115" id="gaugeValue">0.000</text>
+              <text class="gauge-label" x="120" y="135" id="gaugeLabel">EMA Score</text>
+            </svg>
+            <div class="risk-badge risk-IDLE" id="riskBadge">IDLE</div>
+          </div>
+        </div>
+
+        <!-- Metrics -->
+        <div class="card">
+          <div class="card-title"><span class="dot"></span> Stride Metrics</div>
+          <div class="metrics-grid">
+            <div class="metric-box">
+              <div class="metric-label">EMA Score</div>
+              <div class="metric-value" id="metricEma">—</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">Raw Score</div>
+              <div class="metric-value" id="metricRaw">—</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">P(Vocoder)</div>
+              <div class="metric-value" id="metricVocoder">—</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">P(Prosody)</div>
+              <div class="metric-value" id="metricProsody">—</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">Latency</div>
+              <div class="metric-value" id="metricLatency">—</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-label">Pkt Loss</div>
+              <div class="metric-value" id="metricLoss">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column -->
+      <div class="col-right">
+        <div class="card" style="flex:1; display:flex; flex-direction:column;">
+          <div class="card-title"><span class="dot"></span> Live Event Feed</div>
+          <div class="event-log" id="eventLog">
+            <div class="empty-state">
+              <div class="icon">📡</div>
+              <p>Start streaming audio to see real-time risk analysis events here.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      SIH26104 — Voice Clone Impersonation Detection &nbsp;·&nbsp; Real-Time DSP + Fusion Engine &nbsp;·&nbsp; Privacy-Preserving (zero retention)
+    </footer>
+  </div>
+
+  <script>
+    // ===== State =====
+    let ws = null;
+    let audioCtx = null;
+    let mediaStream = null;
+    let workletNode = null;
+    let isStreaming = false;
+    let strideNum = 0;
+    let waveformCtx = null;
+    let waveformData = new Float32Array(256);
+    let animFrameId = null;
+
+    const CHUNK_MS = 200;    // send a chunk every 200ms
+    const TARGET_SR = 16000;
+
+    // ===== DOM refs =====
+    const $gaugeArc     = document.getElementById('gaugeArc');
+    const $gaugeValue   = document.getElementById('gaugeValue');
+    const $riskBadge    = document.getElementById('riskBadge');
+    const $headerBadge  = document.getElementById('headerBadge');
+    const $eventLog     = document.getElementById('eventLog');
+    const $btnMic       = document.getElementById('btnMic');
+    const $btnStop      = document.getElementById('btnStop');
+    const $sessionStatus = document.getElementById('sessionStatus');
+    const $sessionId    = document.getElementById('sessionId');
+    const $modelInfo    = document.getElementById('modelInfo');
+    const $strideCount  = document.getElementById('strideCount');
+    const $audioSource  = document.getElementById('audioSource');
+    const $metricEma    = document.getElementById('metricEma');
+    const $metricRaw    = document.getElementById('metricRaw');
+    const $metricVocoder = document.getElementById('metricVocoder');
+    const $metricProsody = document.getElementById('metricProsody');
+    const $metricLatency = document.getElementById('metricLatency');
+    const $metricLoss   = document.getElementById('metricLoss');
+    const $waveCanvas   = document.getElementById('waveformCanvas');
+
+    // ===== Gauge helpers =====
+    const ARC_LENGTH = 289; // approximate arc path length for the semicircle
+
+    function setGauge(value, riskLevel) {
+      const clamped = Math.max(0, Math.min(1, value));
+      const offset = ARC_LENGTH * (1 - clamped);
+      $gaugeArc.style.strokeDashoffset = offset;
+
+      let color = 'var(--safe)';
+      let filter = 'drop-shadow(0 0 8px var(--safe-glow))';
+      if (riskLevel === 'CRITICAL')       { color = 'var(--critical)'; filter = 'drop-shadow(0 0 12px var(--critical-glow))'; }
+      else if (riskLevel === 'WARNING')   { color = 'var(--warning)'; filter = 'drop-shadow(0 0 10px var(--warning-glow))'; }
+      else if (riskLevel === 'LOW_CONFIDENCE') { color = 'var(--low-conf)'; }
+      $gaugeArc.setAttribute('stroke', color);
+      $gaugeArc.style.filter = filter;
+
+      $gaugeValue.textContent = value.toFixed(3);
+
+      $riskBadge.className = 'risk-badge risk-' + riskLevel;
+      $riskBadge.textContent = riskLevel.replace('_', ' ');
+    }
+
+    // ===== Event log =====
+    let firstEvent = true;
+    function addEvent(type, detail) {
+      if (firstEvent) { $eventLog.innerHTML = ''; firstEvent = false; }
+      const el = document.createElement('div');
+      el.className = 'event-item ev-' + type;
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      el.innerHTML = `<span class="event-type">[${ts}] ${type}</span><span class="event-detail">${detail}</span>`;
+      $eventLog.prepend(el);
+      // Keep max 100 items
+      while ($eventLog.children.length > 100) $eventLog.removeChild($eventLog.lastChild);
+    }
+
+    // ===== WebSocket =====
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws/stream-verify`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        $headerBadge.textContent = 'Connected';
+        $headerBadge.style.background = 'rgba(16, 185, 129, 0.12)';
+        $headerBadge.style.color = 'var(--safe)';
+        $headerBadge.style.borderColor = 'rgba(16, 185, 129, 0.3)';
+        addEvent('system', 'WebSocket connected');
+      };
+
+      ws.onmessage = (evt) => {
+        const data = JSON.parse(evt.data);
+        handleServerEvent(data);
+      };
+
+      ws.onclose = () => {
+        $headerBadge.textContent = 'Disconnected';
+        $headerBadge.style.background = 'rgba(99, 102, 241, 0.12)';
+        $headerBadge.style.color = 'var(--accent)';
+        $headerBadge.style.borderColor = 'var(--border)';
+        addEvent('system', 'WebSocket closed');
+        ws = null;
+      };
+
+      ws.onerror = (err) => {
+        addEvent('system', 'WebSocket error — is the server running?');
+      };
+    }
+
+    function handleServerEvent(data) {
+      if (data.event === 'session_started') {
+        $sessionId.textContent = data.session_id.slice(0, 8) + '…';
+        $sessionId.title = data.session_id;
+        $modelInfo.textContent = data.using_model_fallback ? 'DSP Heuristic' : 'ONNX Model';
+        $sessionStatus.innerHTML = '<span class="status-dot connected"></span>Active';
+        addEvent('session_started', `Session ${data.session_id.slice(0,8)}… | Model: ${data.using_model_fallback ? 'fallback heuristic' : 'ONNX'}`);
+      }
+      else if (data.event === 'risk_update') {
+        strideNum++;
+        $strideCount.textContent = strideNum;
+        setGauge(data.composite_ema, data.risk_level);
+
+        $metricEma.textContent = data.composite_ema.toFixed(4);
+        $metricRaw.textContent = data.composite_raw.toFixed(4);
+        $metricVocoder.textContent = data.p_vocoder.toFixed(4);
+        $metricProsody.textContent = data.p_prosody.toFixed(4);
+        $metricLatency.textContent = data.latency_ms.toFixed(1) + 'ms';
+        $metricLoss.textContent = data.packet_loss_flagged ? '⚠ YES' : '✓ No';
+        $metricLoss.style.color = data.packet_loss_flagged ? 'var(--warning)' : 'var(--safe)';
+
+        addEvent('risk_update', `ema=${data.composite_ema.toFixed(3)} raw=${data.composite_raw.toFixed(3)} risk=${data.risk_level} latency=${data.latency_ms.toFixed(1)}ms`);
+      }
+      else if (data.event === 'liveness_challenge') {
+        addEvent('liveness_challenge', `🔔 "${data.prompt_text}" (expires in ${data.expires_in_ms / 1000}s)`);
+      }
+      else if (data.event === 'liveness_result') {
+        addEvent('liveness_result', `Outcome: ${data.outcome}`);
+      }
+      else if (data.event === 'enforcement_action') {
+        addEvent('enforcement_action', `🚨 Action: ${data.action} | Score: ${data.risk_score.toFixed(3)}`);
+      }
+    }
+
+    // ===== Waveform visualizer =====
+    function initWaveform() {
+      $waveCanvas.width = $waveCanvas.offsetWidth * window.devicePixelRatio;
+      $waveCanvas.height = $waveCanvas.offsetHeight * window.devicePixelRatio;
+      waveformCtx = $waveCanvas.getContext('2d');
+      waveformCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    }
+    function drawWaveform(buffer) {
+      if (!waveformCtx) return;
+      const W = $waveCanvas.offsetWidth;
+      const H = $waveCanvas.offsetHeight;
+      waveformCtx.clearRect(0, 0, W, H);
+
+      waveformCtx.strokeStyle = 'rgba(99, 102, 241, 0.6)';
+      waveformCtx.lineWidth = 1.5;
+      waveformCtx.beginPath();
+      const step = Math.max(1, Math.floor(buffer.length / W));
+      for (let x = 0; x < W; x++) {
+        const idx = Math.min(x * step, buffer.length - 1);
+        const y = (1 - buffer[idx]) * H / 2;
+        if (x === 0) waveformCtx.moveTo(x, y);
+        else waveformCtx.lineTo(x, y);
+      }
+      waveformCtx.stroke();
+    }
+
+    // ===== Microphone streaming =====
+    async function toggleMic() {
+      if (isStreaming) { stopStream(); return; }
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: TARGET_SR, channelCount: 1, echoCancellation: false, noiseSuppression: false } });
+      } catch (e) {
+        addEvent('system', '❌ Microphone access denied: ' + e.message);
+        return;
+      }
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+
+      // Use ScriptProcessorNode (wide browser support)
+      const chunkSamples = Math.round(TARGET_SR * CHUNK_MS / 1000);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      let pcmBuffer = new Float32Array(0);
+
+      connectWS();
+
+      // Wait for WS to open, then send handshake
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) { clearInterval(check); resolve(); }
+        }, 50);
+      });
+
+      ws.send(JSON.stringify({ type: 'handshake', sample_rate: audioCtx.sampleRate }));
+
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        waveformData = input.slice();
+        drawWaveform(waveformData);
+
+        // Accumulate
+        const combined = new Float32Array(pcmBuffer.length + input.length);
+        combined.set(pcmBuffer);
+        combined.set(input, pcmBuffer.length);
+        pcmBuffer = combined;
+
+        while (pcmBuffer.length >= chunkSamples) {
+          const chunk = pcmBuffer.slice(0, chunkSamples);
+          pcmBuffer = pcmBuffer.slice(chunkSamples);
+
+          // Convert float32 -> int16 PCM
+          const int16 = new Int16Array(chunk.length);
+          for (let i = 0; i < chunk.length; i++) {
+            const s = Math.max(-1, Math.min(1, chunk[i]));
+            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'rtp_status', packet_loss: false }));
+            ws.send(int16.buffer);
+          }
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      workletNode = processor;
+
+      isStreaming = true;
+      $btnMic.style.display = 'none';
+      $btnStop.style.display = '';
+      $audioSource.textContent = 'Microphone';
+      $sessionStatus.innerHTML = '<span class="status-dot recording"></span>Recording';
+      strideNum = 0;
+      firstEvent = true;
+      $eventLog.innerHTML = '';
+      addEvent('system', '🎙️ Microphone streaming started');
+    }
+
+    function stopStream() {
+      isStreaming = false;
+      if (workletNode) { workletNode.disconnect(); workletNode = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); }
+
+      $btnMic.style.display = '';
+      $btnStop.style.display = 'none';
+      $sessionStatus.innerHTML = '<span class="status-dot disconnected"></span>Idle';
+      addEvent('system', '⏹ Stream stopped');
+    }
+
+    // ===== WAV file upload streaming =====
+    async function handleFile(evt) {
+      const file = evt.target.files[0];
+      if (!file) return;
+
+      const arrayBuf = await file.arrayBuffer();
+      const dataView = new DataView(arrayBuf);
+
+      // Parse WAV header (minimal)
+      const numChannels = dataView.getUint16(22, true);
+      const sampleRate  = dataView.getUint32(24, true);
+      const bitsPerSamp = dataView.getUint16(34, true);
+
+      if (bitsPerSamp !== 16) {
+        addEvent('system', '❌ Only 16-bit PCM WAV files are supported.');
+        return;
+      }
+
+      // Find 'data' chunk
+      let dataOffset = 12;
+      while (dataOffset < arrayBuf.byteLength - 8) {
+        const chunkId = String.fromCharCode(
+          dataView.getUint8(dataOffset), dataView.getUint8(dataOffset+1),
+          dataView.getUint8(dataOffset+2), dataView.getUint8(dataOffset+3)
+        );
+        const chunkSize = dataView.getUint32(dataOffset + 4, true);
+        if (chunkId === 'data') { dataOffset += 8; break; }
+        dataOffset += 8 + chunkSize;
+      }
+
+      const pcmBytes = new Uint8Array(arrayBuf, dataOffset);
+      let int16Samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
+
+      // Downmix stereo to mono
+      if (numChannels > 1) {
+        const monoLen = Math.floor(int16Samples.length / numChannels);
+        const mono = new Int16Array(monoLen);
+        for (let i = 0; i < monoLen; i++) {
+          let sum = 0;
+          for (let ch = 0; ch < numChannels; ch++) sum += int16Samples[i * numChannels + ch];
+          mono[i] = Math.round(sum / numChannels);
+        }
+        int16Samples = mono;
+      }
+
+      strideNum = 0;
+      firstEvent = true;
+      $eventLog.innerHTML = '';
+      $audioSource.textContent = file.name;
+      addEvent('system', `📁 Loaded ${file.name} — ${sampleRate}Hz, ${numChannels}ch, ${(int16Samples.length / sampleRate).toFixed(1)}s`);
+
+      connectWS();
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) { clearInterval(check); resolve(); }
+        }, 50);
+      });
+
+      ws.send(JSON.stringify({ type: 'handshake', sample_rate: sampleRate }));
+
+      // Stream in chunks, paced in real-time
+      const chunkSamples = Math.round(sampleRate * CHUNK_MS / 1000);
+      let offset = 0;
+      isStreaming = true;
+      $btnMic.disabled = true;
+      $sessionStatus.innerHTML = '<span class="status-dot recording"></span>Streaming file';
+
+      const sendChunk = () => {
+        if (!isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (offset >= int16Samples.length) {
+          addEvent('system', '✅ File streaming complete');
+          $btnMic.disabled = false;
+          $sessionStatus.innerHTML = '<span class="status-dot connected"></span>Done';
+          // Wait a moment, then close
+          setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); }, 1500);
+          return;
+        }
+
+        const end = Math.min(offset + chunkSamples, int16Samples.length);
+        const chunk = int16Samples.slice(offset, end);
+
+        // Draw waveform
+        const floatChunk = new Float32Array(chunk.length);
+        for (let i = 0; i < chunk.length; i++) floatChunk[i] = chunk[i] / 32768;
+        drawWaveform(floatChunk);
+
+        ws.send(JSON.stringify({ type: 'rtp_status', packet_loss: false }));
+        ws.send(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+
+        offset = end;
+        setTimeout(sendChunk, CHUNK_MS);
+      };
+
+      sendChunk();
+      evt.target.value = ''; // reset file input
+    }
+
+    // ===== Init =====
+    window.addEventListener('DOMContentLoaded', () => {
+      initWaveform();
+    });
+    window.addEventListener('resize', initWaveform);
+  </script>
+</body>
+</html>
