@@ -22,6 +22,7 @@ import numpy as np
 import websockets
 import websockets.exceptions
 import pytest
+from auth import create_token
 
 WS_URL = "ws://localhost:8000/ws/stream-verify"
 HEALTHZ_URL = "http://localhost:8000/healthz"
@@ -494,3 +495,162 @@ def test_stream_sample_call_full(tmp_path):
     assert any(
         verdict["mitigation_action"] in risk_actions for verdict in verdicts
     )
+
+
+@pytest.mark.asyncio
+async def test_ws_telemetry_is_session_private():
+    """A caller must not receive telemetry from another caller's session."""
+    token_a = create_token("privacy-caller-a")
+    token_b = create_token("privacy-caller-b")
+    ws_url_a = "ws://localhost:8000/ws/stream?" + urllib.parse.urlencode(
+        {"token": token_a}
+    )
+    ws_url_b = "ws://localhost:8000/ws/stream?" + urllib.parse.urlencode(
+        {"token": token_b}
+    )
+
+    async with (
+        websockets.connect(ws_url_a, max_size=None) as ws_a,
+        websockets.connect(ws_url_b, max_size=None) as ws_b,
+    ):
+        assert json.loads(await ws_a.recv())["event"] == "session_started"
+        assert json.loads(await ws_b.recv())["event"] == "session_started"
+
+        await ws_a.send(json.dumps({"type": "handshake", "sample_rate": 16000}))
+        chunk_bytes, _ = _make_pcm16_chunk(duration_s=0.25)
+        await ws_a.send(json.dumps({"type": "rtp_status", "packet_loss": False}))
+        await ws_a.send(chunk_bytes)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ws_b.recv(), timeout=0.5)
+
+
+# ---- Enrollment authentication tests ----------------------------------------
+
+def _make_enrollment_wav_b64(duration_s: float = 0.5, sr: int = 16000) -> str:
+    """Generate a short valid PCM16 mono WAV and return its base64 encoding."""
+    import base64
+    import io
+
+    num_samples = int(sr * duration_s)
+    t = np.linspace(0, duration_s, num_samples, endpoint=False)
+    signal = (0.3 * np.sin(2 * np.pi * 440.0 * t) * 32767).astype(np.int16)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(signal.tobytes())
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def test_enroll_rejects_missing_token():
+    """POST /enroll with no bearer token must return 401."""
+    import base64
+
+    body = json.dumps({
+        "user_id": "attacker",
+        "audio_b64": base64.b64encode(b"dummy").decode("ascii"),
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:8000/enroll",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc_info.value.code == 401
+
+
+def test_enroll_succeeds_with_valid_token():
+    """Mint a token via /dev/token, POST /enroll with it and a valid WAV -> 200."""
+    user_id = "enroll-test-user"
+    token_url = "http://localhost:8000/dev/token?" + urllib.parse.urlencode(
+        {"sub": user_id}
+    )
+    with urllib.request.urlopen(token_url, timeout=5) as response:
+        token = json.loads(response.read().decode("utf-8"))["token"]
+
+    audio_b64 = _make_enrollment_wav_b64(duration_s=0.5, sr=16000)
+    body = json.dumps({
+        "user_id": user_id,
+        "audio_b64": audio_b64,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:8000/enroll",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        assert response.status == 200
+        data = json.loads(response.read().decode("utf-8"))
+
+    assert data["voiceprint_id"] == user_id
+    assert "model" in data
+    assert isinstance(data["embedding_dim"], int)
+    assert data["embedding_dim"] > 0
+    assert "samples_seconds" in data
+
+
+def test_enroll_rejects_identity_mismatch():
+    """Token sub='alice' trying to enroll user_id='bob' must return 403."""
+    token_url = "http://localhost:8000/dev/token?" + urllib.parse.urlencode(
+        {"sub": "alice"}
+    )
+    with urllib.request.urlopen(token_url, timeout=5) as response:
+        token = json.loads(response.read().decode("utf-8"))["token"]
+
+    audio_b64 = _make_enrollment_wav_b64(duration_s=0.5, sr=16000)
+    body = json.dumps({
+        "user_id": "bob",
+        "audio_b64": audio_b64,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:8000/enroll",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc_info.value.code == 403
+
+
+def test_enroll_succeeds_with_query_token():
+    """POST /enroll?token=<jwt> query parameter authentication path."""
+    user_id = "query-token-user"
+    token_url = "http://localhost:8000/dev/token?" + urllib.parse.urlencode(
+        {"sub": user_id}
+    )
+    with urllib.request.urlopen(token_url, timeout=5) as response:
+        token = json.loads(response.read().decode("utf-8"))["token"]
+
+    audio_b64 = _make_enrollment_wav_b64(duration_s=0.5, sr=16000)
+    body = json.dumps({
+        "user_id": user_id,
+        "audio_b64": audio_b64,
+    }).encode("utf-8")
+    enroll_url = "http://localhost:8000/enroll?" + urllib.parse.urlencode(
+        {"token": token}
+    )
+    req = urllib.request.Request(
+        enroll_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        assert response.status == 200
+        data = json.loads(response.read().decode("utf-8"))
+
+    assert data["voiceprint_id"] == user_id
+

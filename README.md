@@ -51,21 +51,20 @@ loss_ratio>0.35 ───► LOW_CONFIDENCE    (8 × 250ms strides)
         ▼      ▼      ▼
      ALLOW  CHALLENGE  BLOCK
                      │
-             ┌───────┴───────┐
-             ▼               ▼
-      Mitigation Firewall  Telemetry
-         (ALLOW<0.35,     Broadcast
-       CHALLENGE<=0.70,  (risk_update,
-        BLOCK>0.70)       mitigation_verdict,
-                            enforcement_action)
-             │
-          Buffer Purge
-          (in-memory zeroing)
+              ┌───────┴───────┐
+              ▼               ▼
+       Mitigation Firewall  Session Telemetry
+          (ALLOW<0.35,     (risk_update,
+        CHALLENGE<=0.70,   mitigation_verdict,
+         BLOCK>0.70)       enforcement_action)
+              │
+           Buffer Purge
+           (in-memory zeroing)
 ```
 
 **Track A (Phase Anomalies)**: LFCC + phase consistency detection via spectral analysis
 **Track B (Autocorrelation Prosody)**: NORMALIZED AUTOCORRELATION pitch tracking (RMS gate + ACF peak voicing + parabolic lag interpolation) → jitter, shimmer, pause continuity analysis
-**Track C (Identity)**: ECAPA-TDNN speaker verification with MFCC-centroid cosine-similarity fallback; in-memory voiceprint enrollment
+**Track C (Identity)**: ECAPA-TDNN speaker verification (SpeechBrain) with 192-d FFT spectral-shape embedding fallback; in-memory voiceprint enrollment
 
 **Fusion**: 3-way weighted (0.45/0.25/0.30) collapses to 2-way (0.6/0.4) when no voiceprint enrolled
 
@@ -124,10 +123,11 @@ loss_ratio>0.35 ───► LOW_CONFIDENCE    (8 × 250ms strides)
    ```json
    {
      "event": "liveness_challenge",
+     "session_id": "uuid-v4",
      "challenge_id": "uuid-v4",
-     "prompt_text": "Please read the following number: 4829",
-     "tts_engine": "stub",
-     "expires_in_ms": 10000
+     "prompt_text": "Please repeat after me: seven, blue, umbrella, forty-two.",
+     "tts_engine": "sarvam-bulbul-indic-tts",
+     "expires_in_ms": 8000
    }
    ```
 
@@ -240,9 +240,11 @@ docker run -p 8000:8000 sih26104
 - **Memory-only voiceprints**: ECAPA-TDNN embeddings purged on WebSocket disconnect
 
 ### Security
-- **Authentication**: JWT-based with `AUTH_SECRET` environment variable
-- **Token expiry**: Configurable JWT expiration via standard FastAPI security
-- **Secure transport**: WebSocket with authentication headers
+- **Authentication**: JWT-based (HS256) signed with `AUTH_SECRET` environment variable
+- **Dual-path Auth**: Accepted via `Authorization: Bearer <token>` header or `?token=<token>` query parameter across all endpoints (`/ws/stream`, `/ws/stream-verify`, and `/enroll`)
+- **Enrollment Protection (`/enroll`)**: `POST /enroll` requires valid JWT authentication checked before payload consumption. Enforces **identity binding**: the requested `user_id` must match the token's `sub` claim (preventing cross-user voiceprint poisoning; 401 on missing/invalid/expired token, 403 on mismatch)
+- **Session-scoped Telemetry**: WebSocket clients receive only telemetry for their own authenticated session; no cross-session broadcasting
+- **Token expiry**: Configurable JWT expiration (`TOKEN_TTL_S`), timing-safe signature comparison, algorithm pinning
 - **Codec**: Pure NumPy/SciPy autocorrelation pitch tracking (no external dependencies)
 - **No librosa**: NORMALIZED AUTOCORRELATION implementation eliminates librosa/numba dependency chain
 
@@ -257,10 +259,10 @@ docker run -p 8000:8000 sih26104
 
 - **Track A**: ONNX INT8 model wrapper with explainable DSP-heuristic fallback (no checkpoint required)
 - **Track B**: Pure NumPy/SciPy DSP — LFCC, spectral flatness, ZCR, NORMALIZED AUTOCORRELATION pitch contour (RMS gate + ACF peak voicing + parabolic lag interpolation), jitter, shimmer, pause continuity
-- **Track C**: ECAPA-TDNN ONNX speaker encoder with MFCC-centroid cosine-similarity fallback
+- **Track C**: SpeechBrain ECAPA-TDNN speaker encoder with deterministic 192-d FFT spectral-shape embedding fallback (96 mean + 96 delta band energies, L2-normalized)
 - **Fusion**: 3-way weighted sum, decaying EMA over 2.0s window, packet-loss-aware freeze logic
 - **Decision**: 8-stride window with ALLOW/CHALLENGE/BLOCK mitigation firewall
 - **Enforcement**: BLOCK triggers SEVER_SESSION + close(1008)
-- **Telemetry**: All frames broadcast to connected WebSocket clients
+- **Telemetry**: Each WebSocket client receives only telemetry for its own authenticated audio session
 
 All audio processing and risk computation occurs in-memory with zero retention beyond the active session.

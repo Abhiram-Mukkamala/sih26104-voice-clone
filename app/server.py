@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover
     from scipy.signal import resample_poly
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -89,7 +89,7 @@ from fusion_engine import (
     AMBIGUITY_HIGH,
 )
 from speaker_verification import SpeakerVerifier
-from auth import create_token, websocket_authenticate
+from auth import create_token, decode_token, TokenExpired, InvalidToken, websocket_authenticate
 
 app = FastAPI(title="SIH26104 Voice Clone Detection Gateway")
 
@@ -103,25 +103,6 @@ STRIDE_SAMPLES = int(SAMPLE_RATE * STRIDE_S)  # 250ms @ 16kHz = 4000 samples
 acoustic_model = AcousticModel(model_path=None)
 fusion_engine = FusionEngine()
 verifier = SpeakerVerifier()
-
-# ---- Telemetry broadcast: all connected WebSocket sessions -----------------
-_connected_sessions: set[WebSocket] = set()
-
-
-async def _broadcast(payload: dict, exclude: Optional[WebSocket] = None) -> None:
-    """Send a telemetry frame to all connected WebSocket clients."""
-    dead: list[WebSocket] = []
-    for ws in _connected_sessions:
-        if ws is exclude:
-            continue
-        try:
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_json(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        _connected_sessions.discard(ws)
-
 
 class RingBuffer:
     """
@@ -239,11 +220,60 @@ async def dev_token(sub: str = "dev-user"):
 
 
 @app.post("/enroll")
-async def enroll_voiceprint(payload: dict):
-    """Enroll an in-memory voiceprint from a base64-encoded PCM16 WAV."""
+async def enroll_voiceprint(request: Request):
+    """Enroll an in-memory voiceprint from a base64-encoded PCM16 WAV.
+
+    Requires a valid JWT bearer token supplied as either:
+      - query parameter: ``?token=<jwt>``
+      - header: ``Authorization: Bearer <jwt>``
+
+    Identity binding: the enrolled ``user_id`` in the payload MUST match
+    the token's ``sub`` claim. A caller can only enroll their own
+    voiceprint — there is no admin-override path.
+    """
+    # ---- 1. Authenticate (BEFORE touching or validating the body) ------------
+    token = request.query_params.get("token")
+    if not token:
+        authorization = request.headers.get("authorization", "")
+        scheme, _, header_token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and header_token:
+            token = header_token
+
+    if not token:
+        raise HTTPException(401, "Authentication required: provide a bearer token")
+
+    try:
+        claims = decode_token(token)
+    except TokenExpired as exc:
+        raise HTTPException(401, "Token has expired") from exc
+    except InvalidToken as exc:
+        raise HTTPException(401, f"Invalid token: {exc}") from exc
+
+    token_sub = claims.get("sub")
+    if not isinstance(token_sub, str) or not token_sub:
+        raise HTTPException(401, "Invalid token: missing subject claim")
+
+    # ---- 2. Parse & validate payload -----------------------------------------
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Request body must be valid JSON")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Request body must be a JSON object")
+
     user_id, audio_b64 = payload.get("user_id"), payload.get("audio_b64")
     if not isinstance(user_id, str) or not user_id or not isinstance(audio_b64, str):
         raise HTTPException(422, "user_id and audio_b64 are required")
+
+    # ---- 3. Identity binding: enrolled user_id must match token sub ----------
+    if user_id != token_sub:
+        raise HTTPException(
+            403,
+            f"Identity mismatch: token subject '{token_sub}' cannot enroll voiceprint for user '{user_id}'",
+        )
+
+    # ---- 4. Decode audio & enroll --------------------------------------------
     try:
         with wave.open(io.BytesIO(base64.b64decode(audio_b64, validate=True)), "rb") as wav:
             if wav.getsampwidth() != 2:
@@ -290,8 +320,6 @@ async def stream_verify(websocket: WebSocket):
     decision_similarities: list[Optional[float]] = []
     decision_losses: list[bool] = []
     decision_window_index = 0
-
-    _connected_sessions.add(websocket)
 
     await websocket.send_json({
         "event": "session_started",
@@ -382,7 +410,6 @@ async def stream_verify(websocket: WebSocket):
                         "decision_pending": len(decision_emas) + 1 < 8,
                     }
                     await websocket.send_json(risk_payload)
-                    await _broadcast(risk_payload, exclude=websocket)
 
                     # Commit mitigation only after a complete 8-stride window.
                     decision_emas.append(result.composite_ema)
@@ -406,12 +433,10 @@ async def stream_verify(websocket: WebSocket):
                             "risk_level": window_risk.value,
                         }
                         await websocket.send_json(verdict_payload)
-                        await _broadcast(verdict_payload, exclude=websocket)
                         if committed_action == MitigationLevel.CHALLENGE:
                             challenge_payload = {"event": "liveness_challenge",
                                 "session_id": session_id, **generate_liveness_challenge()}
                             await websocket.send_json(challenge_payload)
-                            await _broadcast(challenge_payload, exclude=websocket)
                         if committed_action == MitigationLevel.BLOCK:
                             enforcement_payload = {
                                 "event": "enforcement_action", "session_id": session_id,
@@ -420,7 +445,6 @@ async def stream_verify(websocket: WebSocket):
                                 "risk_score": round(risk_score, 4),
                             }
                             await websocket.send_json(enforcement_payload)
-                            await _broadcast(enforcement_payload, exclude=websocket)
                             ring_buffer.purge()
                             await websocket.close(code=1008)
                             return
@@ -440,7 +464,6 @@ async def stream_verify(websocket: WebSocket):
         traceback.print_exc()
         print("=" * 60 + "\n")
     finally:
-        _connected_sessions.discard(websocket)
         ring_buffer.purge()
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
