@@ -1,83 +1,266 @@
 # SIH26104 — Real-Time Voice Clone Impersonation Detection
 
-Streaming prototype for the 5-layer architecture: ingestion ring buffer →
-dual-track forensic core (Track A deep model, Track B biomechanical DSP) →
-temporal fusion/risk engine → decision gateway → zero-retention privacy plane.
+Streaming 3-track deep+biomechanical+identity fusion gateway. Zero-tolerance voice-clone detection for secure environments (banking calls, authentication systems). Pitch tracking uses NORMALIZED AUTOCORRELATION (RMS gate + ACF peak voicing + parabolic lag interpolation) — NOT librosa.pyin anywhere.
 
-## Files
+## Problem Statement + Threat Model + Design Goals
 
-| File | Layer | Responsibility |
-|---|---|---|
-| `app/dsp_pipeline.py` | Track A + B feature front-end | LFCC, mel-spectrogram, spectral flatness, ZCR, F0 contour, jitter, shimmer, pause continuity |
-| `app/acoustic_model.py` | Track A | ONNX INT8 model wrapper with an explainable DSP-heuristic fallback (no checkpoint required to run) |
-| `app/fusion_engine.py` | Layer 3 | Composite risk (0.6/0.4 weighting), packet-loss-aware EMA over a 3.0s window, threshold gates, liveness ambiguity band, challenge-response state |
-| `app/server.py` | Layers 1, 4, 5 | FastAPI `/ws/stream-verify` WebSocket, ring buffer, G.711/8kHz resampling, liveness challenge issue + resolution, enforcement events, in-place buffer purge |
-| `app/client_simulator.py` | demo | Streams a WAV file into the WebSocket like a live call, prints telemetry |
-| `app/make_test_audio.py` | demo | Generates a synthetic WAV so the demo runs without a real call recording |
-| `app/tests/` | tests | pytest coverage for the fusion engine and DSP feature extraction |
+**Threat Model**: Adversarial voice cloning via modern TTS/vocoder systems (AASIST, RawNet3, WavLM-spoof, diffusion TTS). Attacker injects synthetic audio into a live call stream to impersonate a legitimate user.
 
-## Run it
+**Design Goals**:
+- **<200ms stride**: Real-time processing with 250ms analysis window for sub-second response
+- **Zero retention**: In-memory only processing; audio samples overwritten with zeros immediately after feature extraction
+- **In-memory voiceprints**: ECAPA-TDNN embeddings stored only in RAM, purged on session disconnect
+- **Network resilience**: Packet-loss-aware with EMA freeze when PLC artifacts detected
 
+---
+
+## Architecture Specification
+
+```
+Audio Stream(WS) ─► Ring Buffer(1.0s, 250ms stride)
+                      │
+                 ┌────┴────┐
+                 ▼         ▼
+          Track A         Track B
+     (Phase Anomalies)  (Autocorrelation Prosody)
+   LFCC/phase_consistency   jitter/shimmer/pause
+        p_vocoder         p_prosody
+                 │         │
+                 └────┬────┘
+                      ▼
+              Track C (Identity)
+           ECAPA-TDNN identity :: FFT fallback
+            p_identity = 1 - speaker_similarity
+                      │
+              ┌───────┴───────┐
+              ▼               ▼
+        3-way fusion     2-way fallback
+      (0.45/0.25/0.30)   (0.6/0.4)
+              │
+        Decaying EMA
+       (2.0s window)
+              │
+     ┌─────────────────┐
+     ▼                 ▼
+EMA-freeze logic   Decision Window
+loss_ratio>0.35 ───► LOW_CONFIDENCE    (8 × 250ms strides)
+     │                 │
+     └─────────────────┘
+              │
+        ┌──────┼──────┐
+        ▼      ▼      ▼
+     ALLOW  CHALLENGE  BLOCK
+                     │
+             ┌───────┴───────┐
+             ▼               ▼
+      Mitigation Firewall  Telemetry
+         (ALLOW<0.35,     Broadcast
+       CHALLENGE<=0.70,  (risk_update,
+        BLOCK>0.70)       mitigation_verdict,
+                            enforcement_action)
+             │
+          Buffer Purge
+          (in-memory zeroing)
+```
+
+**Track A (Phase Anomalies)**: LFCC + phase consistency detection via spectral analysis
+**Track B (Autocorrelation Prosody)**: NORMALIZED AUTOCORRELATION pitch tracking (RMS gate + ACF peak voicing + parabolic lag interpolation) → jitter, shimmer, pause continuity analysis
+**Track C (Identity)**: ECAPA-TDNN speaker verification with MFCC-centroid cosine-similarity fallback; in-memory voiceprint enrollment
+
+**Fusion**: 3-way weighted (0.45/0.25/0.30) collapses to 2-way (0.6/0.4) when no voiceprint enrolled
+
+**EMA Freeze Logic**: When packet_loss_ratio > 0.35, EMA holds last valid value (no decay toward noisy estimates)
+
+**Decision Window**: Every 8 strides (2.0s) emits mitigation_verdict
+
+**Mitigation Firewall**: ALLOW<0.35, CHALLENGE≤0.70, BLOCK>0.70 with LOW_CONFIDENCE override on high packet loss
+
+---
+
+## Wire Protocol
+
+### Server → Client JSON Event Frames
+
+1. **`session_started`** — Session initiation
+   ```json
+   {"event": "session_started", "session_id": "uuid-v4", "using_model_fallback": true}
+   ```
+
+2. **`risk_update`** — Per-stride (250ms) telemetry
+   ```json
+   {
+     "event": "risk_update",
+     "session_id": "uuid-v4",
+     "timestamp_ms": 1700000000000,
+     "risk_score": 0.2345,
+     "composite_ema": 0.2345,
+     "composite_raw": 0.2123,
+     "risk_level": "SAFE",
+     "speaker_similarity": 0.8765,
+     "packet_loss": false,
+     "packet_loss_ratio": 0.0,
+     "processing_latency_ms": 45.2,
+     "mitigation_action": "ALLOW",
+     "decision_pending": true
+   }
+   ```
+
+3. **`mitigation_verdict`** — Decision window result (every 2.0s)
+   ```json
+   {
+     "event": "mitigation_verdict",
+     "session_id": "uuid-v4",
+     "window_index": 0,
+     "mitigation_action": "ALLOW",
+     "risk_score": 0.2876,
+     "window_strides": 8,
+     "packet_loss_ratio": 0.0,
+     "speaker_similarity": 0.8765,
+     "risk_level": "SAFE"
+   }
+   ```
+
+4. **`liveness_challenge`** — Out-of-band step-up authentication
+   ```json
+   {
+     "event": "liveness_challenge",
+     "challenge_id": "uuid-v4",
+     "prompt_text": "Please read the following number: 4829",
+     "tts_engine": "stub",
+     "expires_in_ms": 10000
+   }
+   ```
+
+5. **`enforcement_action`** — Terminal action for BLOCK
+   ```json
+   {
+     "event": "enforcement_action",
+     "session_id": "uuid-v4",
+     "action": "SEVER_SESSION",
+     "reason": "BLOCK threshold exceeded",
+     "risk_score": 0.8234
+   }
+   ```
+
+### Client → Server Frames
+
+- **Binary frames**: PCM16LE mono audio chunks (any size, typically 20-160ms per RTP packet)
+- **Text frames**:
+  ```json
+  {"type": "handshake", "sample_rate": 16000, "user_id": "string"}
+  {"type": "rtp_status", "packet_loss": true}
+  ```
+
+---
+
+## Mitigation Semantics
+
+| Action | Behavior | Response |
+|--------|----------|----------|
+| **ALLOW** | Continue normal processing | Stream continues, no intervention |
+| **CHALLENGE** | Trigger out-of-band step-up auth + liveness challenge | Issues `liveness_challenge` frame with random prompt; requires user to respond with correct reading |
+| **BLOCK** | Terminal security action | Emits `enforcement_action` with `action:"SEVER_SESSION"` followed by `websocket.close(code=1008)` |
+
+**Low-Confidence Override**: `packet_loss_ratio > 0.35` forces CHALLENGE regardless of risk score
+
+---
+
+## Exact Local Execution
+
+### Setup
+```bash
+cd /c/Projects/sih26104/sih26104
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# OR on Windows:
+venv\Scripts\activate
+```
+
+### Install Dependencies
 ```bash
 pip install -r requirements.txt
-cd app
-python make_test_audio.py sample_call.wav   # only needed once, or supply your own WAV
-uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-In a second terminal, for a live demo against any 16-bit PCM WAV file:
-
+### Generate Test Audio
 ```bash
-cd app
-python client_simulator.py sample_call.wav --loss 0.1
+python app/make_test_audio.py
 ```
 
-Run the test suite with:
-
+### Start Server
 ```bash
-cd app
-pytest tests/ -q
+uvicorn app.server:app --host 0.0.0.0 --port 8000
+# OR:
+python app/server.py
 ```
 
-`--loss 0.1` randomly flags 10% of chunks as packet-loss-affected so the
-jury can visually see the EMA freeze instead of spiking on network noise.
+### Run Tests
+```bash
+pytest app/tests
+```
 
-## Measured latency (this environment, CPU-only, DSP-heuristic fallback)
+### Stream with Client Simulator (No Identity Track)
+```bash
+python app/client_simulator.py sample_call.wav --loss 0.15
+```
 
-Cold first stride ~640ms (one-time librosa/JIT warmup inside the process).
-Steady-state: **~41-44ms per 250ms stride** — roughly 6x inside the 250ms
-budget, leaving headroom for a real ONNX AASIST/RawNet3 checkpoint once
-trained (typical INT8 CPU inference for these architectures on a 1s clip:
-15-40ms depending on hardware).
+### Stream with Identity Track Enabled
+```bash
+python app/client_simulator.py sample_call.wav --loss 0.15 --enroll
+```
 
-## Fixed since last pass
+The `--enroll` flag triggers `/enroll` endpoint to create an in-memory voiceprint, enabling Track C (ECAPA-TDNN identity) with 3-way fusion weights (0.45/0.25/0.30). Without `--enroll`, Track C is omitted and weights collapse to 2-way (0.6/0.4).
 
-- **Liveness challenge was firing on every stride** while risk stayed in
-  the ambiguity band (a fresh challenge every ~50-250ms). It now issues
-  one challenge, holds state, and resolves it (`liveness_result: passed`
-  or `failed_or_timed_out`) before another can be issued.
-- **Server crash on client disconnect** (`RuntimeError: Cannot call
-  "send" once a close message has been sent`) — a benign state-check race
-  in the WebSocket teardown; now caught rather than propagating as an
-  ASGI-level exception.
-- **`client_simulator.py` stereo downmix was byte-sliced incorrectly**,
-  producing garbage audio for any non-mono WAV — now reshapes to
-  `(frames, n_channels)` and averages properly.
-- Added `make_test_audio.py` so the documented demo command actually has
-  a WAV to stream (none was shipped), and a `tests/` pytest suite for the
-  fusion engine and DSP feature extraction (none existed before).
+---
 
-## What's a placeholder vs. production-ready
+## Docker
 
-- **Track A model**: `acoustic_model.py` runs a transparent DSP heuristic
-  when no `.onnx` checkpoint is supplied. Swap in a trained AASIST/RawNet3/
-  WavLM-spoof INT8 model — the rest of the pipeline (fusion, server,
-  WebSocket contract) does not change.
-- **F0 extraction**: uses `librosa.pyin` to avoid a compiled dependency in
-  this sandbox. Swap for PyWorld DIO/Harvest in production for lower
-  per-stride latency (see `dsp_pipeline.compute_f0_contour` docstring).
-- **Liveness TTS**: `generate_liveness_challenge()` is a stub; wire it to
-  the actual Sarvam Bulbul (or equivalent Indic TTS) API.
-- **RTP/WebRTC mirroring**: this prototype takes PCM over the WebSocket
-  directly, standing in for the ingestion proxy — swap the transport, not
-  the ring buffer or feature/fusion logic.
+### Build (Light - Default)
+```bash
+docker build -t sih26104 .
+```
+
+### Build (Heavy - with ECAPA-TDNN dependencies)
+```bash
+docker build -t sih26104 --build-arg INSTALL_HEAVY=true .
+```
+
+### Run
+```bash
+docker run -p 8000:8000 sih26104
+```
+
+---
+
+## Privacy Plane + Security
+
+### Privacy
+- **Zero retention**: Audio processed in 1-second in-memory ring buffer
+- **In-place zeroing**: Audio samples overwritten with zeros immediately after feature extraction
+- **No disk writes**: Only telemetry (scores, timestamps, flags) retained in SessionRiskState.history
+- **Memory-only voiceprints**: ECAPA-TDNN embeddings purged on WebSocket disconnect
+
+### Security
+- **Authentication**: JWT-based with `AUTH_SECRET` environment variable
+- **Token expiry**: Configurable JWT expiration via standard FastAPI security
+- **Secure transport**: WebSocket with authentication headers
+- **Codec**: Pure NumPy/SciPy autocorrelation pitch tracking (no external dependencies)
+- **No librosa**: NORMALIZED AUTOCORRELATION implementation eliminates librosa/numba dependency chain
+
+### Configuration
+- `AUTH_SECRET`: Required environment variable for JWT signing
+- `INSTALL_HEAVY=true`: Docker build argument for ECAPA-TDNN runtime
+- All thresholds and weights defined as constants in `fusion_engine.py`
+
+---
+
+## Implementation Notes
+
+- **Track A**: ONNX INT8 model wrapper with explainable DSP-heuristic fallback (no checkpoint required)
+- **Track B**: Pure NumPy/SciPy DSP — LFCC, spectral flatness, ZCR, NORMALIZED AUTOCORRELATION pitch contour (RMS gate + ACF peak voicing + parabolic lag interpolation), jitter, shimmer, pause continuity
+- **Track C**: ECAPA-TDNN ONNX speaker encoder with MFCC-centroid cosine-similarity fallback
+- **Fusion**: 3-way weighted sum, decaying EMA over 2.0s window, packet-loss-aware freeze logic
+- **Decision**: 8-stride window with ALLOW/CHALLENGE/BLOCK mitigation firewall
+- **Enforcement**: BLOCK triggers SEVER_SESSION + close(1008)
+- **Telemetry**: All frames broadcast to connected WebSocket clients
+
+All audio processing and risk computation occurs in-memory with zero retention beyond the active session.

@@ -1,64 +1,58 @@
-# SIH26104 — Voice Clone Impersonation Detection Gateway
+# Claude Context — SIH26104 Voice Clone Detection Gateway
 
-## Project Overview
-This project is a real-time Voice Clone Impersonation Detection Gateway built for secure environments (like banking calls). It exposes a bidirectional WebSocket that ingests raw PCM16LE mono audio (simulating a VoIP/RTP stream) and emits real-time telemetry and risk assessments every 250ms. 
+Read `README.md` and `claude_context.md` first (architecture, wire protocol, thresholds, run commands, and the hard constraints that are not in the README). This file tracks what has happened so far — the verified state of the project as of the latest check.
 
-It operates using a dual-track detection strategy:
-- **Track A (Acoustic/Deep Model):** Uses LFCC features fed into an INT8-quantized ONNX acoustic model (e.g., AASIST/RawNet3) to detect synthetic vocoder artifacts.
-- **Track B (Biomechanical/Prosody):** Analyzes pitch (F0), jitter, shimmer, and respiratory pause continuity to detect unnatural speech patterns typical of TTS engines.
-- **Fusion Engine:** Combines these scores using an Exponential Moving Average (EMA) and gracefully handles RTP packet loss (masking/freezing the EMA when Packet Loss Concealment artifacts are present).
-- **Privacy Plane:** All audio is processed in a 1-second in-memory ring buffer. Audio samples are overwritten with zeroes immediately after feature extraction. Nothing is written to disk.
+## Project & Workflow
 
-## Directory Structure
-```text
-C:\Projects\sih26104\sih26104
-├── README.md                 # Project documentation
-├── requirements.txt          # Python dependencies (numpy, scipy, fastapi, uvicorn, onnxruntime, websockets)
-└── app/
-    ├── server.py             # FastAPI WebSocket server and coordination layer
-    ├── dsp_pipeline.py       # Pure NumPy/SciPy feature extraction (LFCC, F0, Jitter, Shimmer, etc.)
-    ├── acoustic_model.py     # ONNX runtime wrapper (with a fallback DSP heuristic if no checkpoint exists)
-    ├── fusion_engine.py      # Combines Track A & B probabilities into a unified EMA risk score
-    ├── client_simulator.py   # CLI WebSocket client to simulate a VoIP caller streaming a WAV file
-    ├── make_test_audio.py    # Utility to generate a synthetic test WAV file (sample_call.wav)
-    ├── sample_call.wav       # Generated test audio file
-    ├── static/
-    │   └── index.html        # Real-time Web UI Dashboard (served at /)
-    └── tests/                # Test suite (pytest)
-        ├── test_dsp_pipeline.py 
-        ├── test_fusion_engine.py
-        └── test_server_e2e.py
-```
+- Project root: `C:\Projects\sih26104\sih26104` (parent `C:\Projects\sih26104` is the VSC workspace).
+- Code is agent-generated. The user writes code themselves in Antigravity/VSC — deliver findings and prompts; do NOT edit files directly unless explicitly asked.
+- Before/after changes, re-verify the baseline below. E2E tests SKIP (do NOT fail) when the server is offline.
 
-## File Descriptions
+## Verified Baseline (current ground truth — 06-09-2026)
 
-### Core Pipeline (`app/`)
-* **`server.py`**
-  The entry point. Runs a FastAPI server with a WebSocket at `/ws/stream-verify`. Manages the `RingBuffer` (1s capacity, 250ms stride). Handles incoming binary audio and JSON control messages (`handshake`, `rtp_status`), orchestrates the DSP/Acoustic models, and pushes `risk_update`, `liveness_challenge`, and `enforcement_action` JSON events back to the client. Also serves the `index.html` dashboard at `/`.
+- Unit tests: **64 passed** (`test_dsp_pipeline` 5, `test_fusion_engine` 11, `test_speaker_encoder` 17, `test_speaker_verification` 31).
+- E2E tests: **12 passed** against a live server — includes `test_ws_rejects_unauthenticated`, `test_ws_block_enforcement`, `test_ws_stream_wav_file`, `test_stream_sample_call_full`. Total = **76 passed**.
+- Live client simulator verified: `session_started` → `risk_update` → `mitigation_verdict` every 8 strides → `liveness_challenge`; risk ~0.56 (WARNING/CHALLENGE); packet-loss freeze/override fire correctly.
+- Server currently on `127.0.0.1:8000`, `/healthz` OK: `{"status":"ok","using_model_fallback":true,"speaker_encoder_fallback":true,"sample_rate":16000}`.
 
-* **`dsp_pipeline.py`**
-  100% pure NumPy/SciPy digital signal processing engine (zero librosa/numba dependencies). Exposes `extract_all_features()` which computes Linear Frequency Cepstral Coefficients (LFCC) for the neural model, and extracts F0 contour (via autocorrelation), spectral flatness, ZCR, jitter, shimmer, and pause continuity for the biomechanical track.
+## What Has Happened / Completed
 
-* **`acoustic_model.py`**
-  Wraps the ONNX runtime for the deep-learning model. Exposes `predict_vocoder_probability()`. If no `.onnx` checkpoint is provided, it seamlessly falls back to a deterministic, explainable DSP heuristic based on LFCC fine-detail variance so the system remains fully functional for testing.
+1. **Initial agent-written codebase** produced at `C:\Projects\sih26104\sih26104`: mitigation firewall (`app/server.py`), dashboard (`app/static/index.html`), authenticated client simulator (`app/client_simulator.py`), 8th deliverable e2e test, Dockerfile (`INSTALL_HEAVY`, non-root, HEALTHCHECK), README (autocorrelation not librosa.pyin). Unit 84 + e2e 11 at review time.
+2. **Full review completed.** Findings issued as fix prompts:
+   - FIX 1 — Dashboard had no red animated "Voice Cloning Detected" banner and no `mitigation_verdict` handler.
+   - FIX 2 — Legacy `/ws/stream-verify` alias skipped JWT auth (path-conditional); no auth-rejection test existed.
+   - FIX 3 — Duplicate decision window: `fusion_engine.process_stride` kept a verdict accumulator that `server.py` discarded (`result, _ =`) while `server.py` computed its own `decision_emas`. Shared thresholds (0.35 / 0.70 / freeze 0.35 / 8 strides) were duplicated constants.
+   - FIX 4 — Dashboard field-name mismatch: read `data.latency_ms` / `data.packet_loss_flagged` while server sends `processing_latency_ms` / `packet_loss` → `undefined.toFixed()` TypeError killed the event feed.
+3. **Fixes applied and re-verified**: FIX 1–4 are DONE in the repo.
+   - `#cloneBanner` exists (`index.html:476`), CSS shake/pulse animation (`index.html:68`), triggered on `mitigation_verdict === BLOCK` and `enforcement_action === SEVER_SESSION` (`index.html:813,823`).
+   - `mitigation_verdict` handler added (`index.html:820`).
+   - Metrics grid reworked to 6 tiles: EMA Score, Raw Score, **Speaker Sim**, **Loss Ratio**, Latency, Pkt Loss (`index.html:589-594`).
+   - `test_ws_rejects_unauthenticated` added (`test_server_e2e.py:121`) → e2e went 11 → 12.
+   - Fusion engine now returns stride-only results (`test_fusion_engine.py:35`), shared policy definitions verified (`test_fusion_engine.py:15`) → unit count 84 → 64.
+4. **`claude_context.md`** created at project root (conventions + constraints). This file documents the full trail.
 
-* **`fusion_engine.py`**
-  Contains `FusionEngine` and `SessionRiskState`. Computes a weighted sum of Track A and Track B probabilities, applies an EMA over a 3-second rolling window, and maps the score to risk levels (`SAFE`, `WARNING`, `CRITICAL`). Most importantly, if a stride is flagged as containing packet loss, it *freezes* the EMA to prevent network artifacts from artificially inflating the risk score.
+## Architecture (implemented, unchanged)
 
-### Frontend (`app/static/`)
-* **`index.html`**
-  A standalone, dependency-free dashboard. Connects to the WebSocket, allows users to stream their microphone or upload a WAV file, renders real-time waveforms on a canvas, and provides a live gauge and scrolling event log of the server's telemetry.
+- Ring buffer 1.0s / 250ms stride; Track A LFCC/spectral anomalies; Track B normalized-autocorrelation prosody (RMS gate + ACF peak voicing + parabolic lag interpolation, no librosa.pyin); Track C identity: ECAPA-TDNN with FFT-spectral fallback (192-d L2-normalised, in-memory, model-type mismatch → None).
+- Fusion 3-way 0.45/0.25/0.30 ⇒ 2-way 0.6/0.4 when unenrolled; `p_identity = 1 − similarity`.
+- EMA freeze at `packet_loss_ratio > 0.35`; decision window 2.0s = 8 × 250ms strides; ALLOW < 0.35, CHALLENGE ≤ 0.70, BLOCK > 0.70; BLOCK → `enforcement_action {action:"SEVER_SESSION"}` then `close(code=1008)`.
+- Auth: stdlib HS256 JWT (`AUTH_SECRET`), alg pinned, `nbf`/`exp` enforced, timing-safe compare; WS accepts `?token=` or `Authorization: Bearer` on EVERY route.
+- Zero retention: audio zeroed after feature extraction, no disk writes, in-memory voiceprints purged on disconnect.
 
-### Utilities and Tests
-* **`make_test_audio.py`** & **`sample_call.wav`**
-  Generates a 6-second synthetic 16kHz PCM audio file with wandering pitch and irregular volume gaps to give the DSP pipeline non-degenerate data to analyze.
-* **`client_simulator.py`**
-  A Python CLI equivalent to the dashboard. Connects to the WebSocket and streams a WAV file in real-time, printing the server's JSON responses to the terminal. Supports simulated packet loss via the `--loss` flag.
-* **`tests/`**
-  A comprehensive pytest suite validating the DSP math, fusion engine logic (especially the packet-loss freeze behavior), and a fully async end-to-end WebSocket integration test (`test_server_e2e.py`).
+## Wire Protocol (server → client)
 
-## Current Status
-- The system is fully operational.
-- The librosa dependency was recently removed in favor of a custom NumPy autocorrelation pitch extractor to resolve runtime crashes.
-- Tests (both unit and full async E2E) are passing 100%.
-- Server observability has been hardened with `traceback.print_exc()` inside the WebSocket loop.
+| Event | Payload fields |
+|---|---|
+| `session_started` | `session_id`, `using_model_fallback` |
+| `risk_update` | `risk_score`, `composite_ema`, `composite_raw`, `risk_level`, `p_identity`, `speaker_similarity`, `packet_loss`, `packet_loss_ratio`, `processing_latency_ms`, `mitigation_action`, `decision_pending` |
+| `mitigation_verdict` | `session_id`, `window_index`, `mitigation_action`, `risk_score`, `window_strides`, `packet_loss_ratio`, `speaker_similarity`, `risk_level` |
+| `liveness_challenge` | `challenge_id`, `prompt_text`, `tts_engine`, `expires_in_ms` |
+| `enforcement_action` | `action` (`SEVER_SESSION`), `reason`, `risk_score` |
+
+Wire field names are FROZEN — `index.html` and `client_simulator.py` depend on them.
+
+## Notes / Known Caveats
+
+- Fallback DSP path is what runs locally (no torch/speechbrain); tests must not require heavy deps.
+- Python 3.11, websockets 15+ (`additional_headers` in `websockets.connect`, NOT `extra_headers`).
+- Earlier `.pytest_cache` failures were from running e2e against a stale server instance; not real test failures.

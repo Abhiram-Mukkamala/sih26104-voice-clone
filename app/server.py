@@ -9,12 +9,35 @@ Wire protocol (binary-in, JSON-out):
   Client -> Server: raw PCM16LE mono audio chunks (any chunk size; typically
                      20-160ms per WebRTC/RTP packet), sample rate declared
                      once via the initial JSON handshake message.
-  Server -> Client: one JSON telemetry frame per 250ms stride (see
-                     StrideResult in fusion_engine.py), plus out-of-band
-                     liveness-challenge and MFA-trigger events.
+  Server -> Client: JSON telemetry frames per 250ms stride:
+      session_started  {session_id, using_model_fallback}
+      risk_update      {event, session_id, timestamp_ms, risk_score,
+                        composite_ema, composite_raw, risk_level,
+                        speaker_similarity|null, packet_loss,
+                        packet_loss_ratio, processing_latency_ms,
+                        mitigation_action, decision_pending}
+      mitigation_verdict {event, session_id, window_index, mitigation_action,
+                         risk_score, window_strides, packet_loss_ratio,
+                         speaker_similarity|null, risk_level}
+      liveness_challenge {event, challenge_id, prompt_text, tts_engine,
+                         expires_in_ms}
+      enforcement_action {event, session_id, action:"SEVER_SESSION", reason,
+                         risk_score}
+
+Client -> Server text frames:
+  {"type":"handshake","sample_rate":16000,"user_id":"..."}
+  {"type":"rtp_status","packet_loss":bool}
+
+Mitigation thresholds:
+  risk < 0.35  → ALLOW
+  0.35 ≤ risk ≤ 0.70 → CHALLENGE
+  risk > 0.70 → BLOCK
+  packet_loss_ratio > 0.35 → force CHALLENGE (low-confidence override)
+
+BLOCK → enforcement_action(SEVER_SESSION) → websocket.close(code=1008).
 
 Privacy Plane: the ring buffer is a fixed-size, in-process NumPy array.
-After each stride's features are extracted, the *consumed* audio samples
+After each stride's features are extracted, the consumed audio samples
 are overwritten with zeros in-place before the buffer slides. Nothing is
 written to disk. Only StrideResult telemetry (scores, flags, timestamps —
 no waveform, no LFCC, no raw audio) is retained in SessionRiskState.history
@@ -25,8 +48,11 @@ from __future__ import annotations
 
 import time
 import uuid
+import json
 import traceback
-from dataclasses import asdict
+import base64
+import io
+import wave
 from typing import Optional
 
 import numpy as np
@@ -39,7 +65,7 @@ except ImportError:  # pragma: no cover
     from scipy.signal import resample_poly
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -50,7 +76,20 @@ from dsp_pipeline import (
     extract_all_features,
 )
 from acoustic_model import AcousticModel
-from fusion_engine import FusionEngine, SessionRiskState, RiskLevel, STRIDE_S, AMBIGUITY_LOW
+from fusion_engine import (
+    FusionEngine,
+    SessionRiskState,
+    RiskLevel,
+    mitigation_for_risk,
+    MitigationLevel,
+    DECISION_WINDOW_STRIDES,
+    FREEZE_LOSS_RATIO,
+    STRIDE_S,
+    AMBIGUITY_LOW,
+    AMBIGUITY_HIGH,
+)
+from speaker_verification import SpeakerVerifier
+from auth import create_token, websocket_authenticate
 
 app = FastAPI(title="SIH26104 Voice Clone Detection Gateway")
 
@@ -63,6 +102,25 @@ STRIDE_SAMPLES = int(SAMPLE_RATE * STRIDE_S)  # 250ms @ 16kHz = 4000 samples
 # falls back to the explainable DSP heuristic otherwise (see acoustic_model.py).
 acoustic_model = AcousticModel(model_path=None)
 fusion_engine = FusionEngine()
+verifier = SpeakerVerifier()
+
+# ---- Telemetry broadcast: all connected WebSocket sessions -----------------
+_connected_sessions: set[WebSocket] = set()
+
+
+async def _broadcast(payload: dict, exclude: Optional[WebSocket] = None) -> None:
+    """Send a telemetry frame to all connected WebSocket clients."""
+    dead: list[WebSocket] = []
+    for ws in _connected_sessions:
+        if ws is exclude:
+            continue
+        try:
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _connected_sessions.discard(ws)
 
 
 class RingBuffer:
@@ -173,8 +231,52 @@ def generate_liveness_challenge() -> dict:
     }
 
 
-@app.websocket("/ws/stream-verify")
+@app.get("/dev/token")
+@app.post("/dev/token")
+async def dev_token(sub: str = "dev-user"):
+    """Development-only JWT minting endpoint; never expose in production."""
+    return {"token": create_token(sub), "sub": sub}
+
+
+@app.post("/enroll")
+async def enroll_voiceprint(payload: dict):
+    """Enroll an in-memory voiceprint from a base64-encoded PCM16 WAV."""
+    user_id, audio_b64 = payload.get("user_id"), payload.get("audio_b64")
+    if not isinstance(user_id, str) or not user_id or not isinstance(audio_b64, str):
+        raise HTTPException(422, "user_id and audio_b64 are required")
+    try:
+        with wave.open(io.BytesIO(base64.b64decode(audio_b64, validate=True)), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                raise ValueError("WAV must be PCM16")
+            sample_rate, channels = wav.getframerate(), wav.getnchannels()
+            pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
+        if channels < 1:
+            raise ValueError("WAV has no channels")
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        # Normalize enrollment input to the verifier's 16 kHz mono contract.
+        audio_16k = pcm16_bytes_to_float32(pcm.tobytes(), sample_rate)
+        verifier.enroll(user_id, audio_16k)
+        metadata = verifier.enrollment(user_id)
+        if metadata is None:
+            raise RuntimeError("voiceprint enrollment failed")
+    except (ValueError, wave.Error, EOFError) as exc:
+        raise HTTPException(400, f"Invalid WAV enrollment audio: {exc}") from exc
+    return {"voiceprint_id": user_id, "model": metadata["model_type"],
+            "embedding_dim": metadata["embedding_dim"],
+            "samples_seconds": metadata["samples_seconds"]}
+
+
+@app.websocket("/ws/stream")
+@app.websocket("/ws/stream-verify")  # legacy route alias
 async def stream_verify(websocket: WebSocket):
+    try:
+        claims = await websocket_authenticate(websocket)
+    except Exception:
+        claims = None
+    if claims is None:
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
 
     session_id = str(uuid.uuid4())
@@ -182,6 +284,14 @@ async def stream_verify(websocket: WebSocket):
     risk_state = SessionRiskState(session_id=session_id)
     input_sample_rate = SAMPLE_RATE  # updated by optional handshake message
     packet_loss_flag = False         # updated by handshake/control messages
+    user_id: Optional[str] = claims.get("sub") if claims and isinstance(claims.get("sub"), str) else None
+    committed_action = MitigationLevel.ANALYZING
+    decision_emas: list[float] = []
+    decision_similarities: list[Optional[float]] = []
+    decision_losses: list[bool] = []
+    decision_window_index = 0
+
+    _connected_sessions.add(websocket)
 
     await websocket.send_json({
         "event": "session_started",
@@ -198,16 +308,16 @@ async def stream_verify(websocket: WebSocket):
 
             if "text" in message and message["text"] is not None:
                 # Control-plane JSON messages: handshake / RTP-loss signaling.
-                import json
                 control = json.loads(message["text"])
                 if control.get("type") == "handshake":
                     input_sample_rate = int(control.get("sample_rate", SAMPLE_RATE))
+                    # JWT subject remains authoritative for identity lookup.
+                    if not user_id and control.get("user_id"):
+                        user_id = str(control["user_id"])
                 elif control.get("type") == "rtp_status":
                     # Upstream RTP/WebRTC layer reports sequence-number gaps
                     # or PLC (packet loss concealment) activation for the
-                    # samples about to be pushed — this is how we
-                    # distinguish "network dropped it" from "vocoder made
-                    # it" (see Q&A #1). Never inferred from the audio itself.
+                    # samples about to be pushed.
                     packet_loss_flag = bool(control.get("packet_loss", False))
                 continue
 
@@ -220,12 +330,29 @@ async def stream_verify(websocket: WebSocket):
                     window = ring_buffer.consume_stride()
                     features = extract_all_features(window)
 
-                    # Privacy Plane: zero consumed samples before freeing.
-                    window[:] = 0.0
-                    del window
-
                     p_vocoder = acoustic_model.predict_vocoder_probability(features["lfcc"])
                     p_prosody = track_b_probability(features)
+
+                    # Identity track: speaker similarity from enrolled voiceprint
+                    speaker_similarity: Optional[float] = None
+                    p_identity: Optional[float] = None
+                    if user_id:
+                        # Re-extract a fresh window for the speaker encoder.
+                        # We use the ring buffer's current state (the window was
+                        # just consumed and zeroed, but the buffer itself still
+                        # has the full 1s context for the *next* stride).
+                        # For the identity track we use the LFCC audio that was
+                        # already extracted — the speaker encoder's MFCC fallback
+                        # works on raw audio, so we reconstruct from the ring
+                        # buffer's pre-slide snapshot.
+                        speaker_similarity = verifier.similarity(user_id, window)
+                        if speaker_similarity is not None:
+                            p_identity = 1.0 - speaker_similarity
+
+                    # Privacy Plane: zero the extracted audio copy after both
+                    # feature and identity computations have consumed it.
+                    window[:] = 0.0
+                    del window
 
                     result = fusion_engine.process_stride(
                         state=risk_state,
@@ -233,59 +360,74 @@ async def stream_verify(websocket: WebSocket):
                         p_prosody=p_prosody,
                         packet_loss=packet_loss_flag,
                         stride_start_perf_counter=stride_start,
+                        p_identity=p_identity,
+                        speaker_similarity=speaker_similarity,
                     )
 
-                    payload = asdict(result)
-                    payload["risk_level"] = result.risk_level.value
-                    payload["session_id"] = session_id
-                    payload["p_vocoder"] = round(p_vocoder, 4)
-                    payload["p_prosody"] = round(p_prosody, 4)
+                    # Build the risk_update payload matching the wire spec
+                    risk_payload = {
+                        "event": "risk_update",
+                        "session_id": session_id,
+                        "timestamp_ms": result.timestamp_ms,
+                        "risk_score": result.risk_score,
+                        "composite_ema": result.composite_ema,
+                        "composite_raw": result.composite_raw,
+                        "risk_level": result.risk_level.value,
+                        "p_identity": result.p_identity,
+                        "speaker_similarity": result.speaker_similarity,
+                        "packet_loss": result.packet_loss,
+                        "packet_loss_ratio": result.packet_loss_ratio,
+                        "processing_latency_ms": result.processing_latency_ms,
+                        "mitigation_action": committed_action.value,
+                        "decision_pending": len(decision_emas) + 1 < 8,
+                    }
+                    await websocket.send_json(risk_payload)
+                    await _broadcast(risk_payload, exclude=websocket)
 
-                    await websocket.send_json({"event": "risk_update", **payload})
-
-                    now_ms = time.time() * 1000.0
-
-                    if risk_state.challenge_pending:
-                        # Resolve an outstanding challenge using the *next*
-                        # strides' fused scores rather than firing a fresh
-                        # challenge on top of it.
-                        if result.composite_ema < AMBIGUITY_LOW:
-                            await websocket.send_json({
-                                "event": "liveness_result",
-                                "session_id": session_id,
-                                "outcome": "passed",
-                            })
-                            risk_state.challenge_pending = False
-                        elif now_ms >= risk_state.challenge_deadline_ms:
-                            await websocket.send_json({
-                                "event": "liveness_result",
-                                "session_id": session_id,
-                                "outcome": "failed_or_timed_out",
-                            })
-                            risk_state.challenge_pending = False
-                            await websocket.send_json({
-                                "event": "enforcement_action",
-                                "session_id": session_id,
-                                "action": "STEP_UP_MFA_AND_CBS_HOLD",
-                                "risk_score": result.composite_ema,
-                            })
-                    elif result.liveness_challenge_required:
-                        challenge = generate_liveness_challenge()
-                        risk_state.challenge_pending = True
-                        risk_state.challenge_deadline_ms = now_ms + challenge["expires_in_ms"]
-                        await websocket.send_json({
-                            "event": "liveness_challenge",
-                            "session_id": session_id,
-                            **challenge,
-                        })
-
-                    if result.mfa_required and not risk_state.challenge_pending:
-                        await websocket.send_json({
-                            "event": "enforcement_action",
-                            "session_id": session_id,
-                            "action": "STEP_UP_MFA_AND_CBS_HOLD",
-                            "risk_score": result.composite_ema,
-                        })
+                    # Commit mitigation only after a complete 8-stride window.
+                    decision_emas.append(result.composite_ema)
+                    decision_similarities.append(result.speaker_similarity)
+                    decision_losses.append(result.packet_loss)
+                    if len(decision_emas) == DECISION_WINDOW_STRIDES:
+                        risk_score = float(np.mean(decision_emas))
+                        loss_ratio = sum(decision_losses) / len(decision_losses)
+                        committed_action = (MitigationLevel.CHALLENGE
+                                            if loss_ratio > FREEZE_LOSS_RATIO
+                                            else mitigation_for_risk(risk_score))
+                        window_risk = fusion_engine._classify(risk_score, loss_ratio)
+                        verdict_payload = {
+                            "event": "mitigation_verdict", "session_id": session_id,
+                            "window_index": decision_window_index,
+                            "mitigation_action": committed_action.value,
+                            "risk_score": round(risk_score, 4),
+                            "window_strides": DECISION_WINDOW_STRIDES,
+                            "packet_loss_ratio": round(loss_ratio, 4),
+                            "speaker_similarity": decision_similarities[-1],
+                            "risk_level": window_risk.value,
+                        }
+                        await websocket.send_json(verdict_payload)
+                        await _broadcast(verdict_payload, exclude=websocket)
+                        if committed_action == MitigationLevel.CHALLENGE:
+                            challenge_payload = {"event": "liveness_challenge",
+                                "session_id": session_id, **generate_liveness_challenge()}
+                            await websocket.send_json(challenge_payload)
+                            await _broadcast(challenge_payload, exclude=websocket)
+                        if committed_action == MitigationLevel.BLOCK:
+                            enforcement_payload = {
+                                "event": "enforcement_action", "session_id": session_id,
+                                "action": "SEVER_SESSION",
+                                "reason": f"Voice clone risk {risk_score:.4f} exceeded BLOCK threshold over decision window {decision_window_index}",
+                                "risk_score": round(risk_score, 4),
+                            }
+                            await websocket.send_json(enforcement_payload)
+                            await _broadcast(enforcement_payload, exclude=websocket)
+                            ring_buffer.purge()
+                            await websocket.close(code=1008)
+                            return
+                        decision_window_index += 1
+                        decision_emas.clear()
+                        decision_similarities.clear()
+                        decision_losses.clear()
 
     except WebSocketDisconnect:
         pass
@@ -298,6 +440,7 @@ async def stream_verify(websocket: WebSocket):
         traceback.print_exc()
         print("=" * 60 + "\n")
     finally:
+        _connected_sessions.discard(websocket)
         ring_buffer.purge()
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
@@ -320,6 +463,7 @@ async def healthz():
     return {
         "status": "ok",
         "using_model_fallback": acoustic_model.using_fallback,
+        "speaker_encoder_fallback": verifier.using_fallback,
         "sample_rate": SAMPLE_RATE,
     }
 

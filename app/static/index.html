@@ -64,6 +64,34 @@
       100% { transform: translate(-3%, 3%) rotate(2deg); }
     }
 
+    /* ===== Banner ===== */
+    #cloneBanner {
+      display: none;
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid var(--critical);
+      color: #fff;
+      padding: 16px 24px;
+      margin-bottom: 24px;
+      border-radius: var(--radius);
+      box-shadow: 0 0 20px var(--critical-glow);
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 1.1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .banner-shake {
+      animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both infinite;
+    }
+    @keyframes shake {
+      10%, 90% { transform: translate3d(-1px, 0, 0); }
+      20%, 80% { transform: translate3d(2px, 0, 0); }
+      30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
+      40%, 60% { transform: translate3d(4px, 0, 0); }
+    }
+
     /* ===== Layout ===== */
     .app-wrapper {
       position: relative;
@@ -444,6 +472,12 @@
 </head>
 <body>
   <div class="app-wrapper">
+    <!-- Clone Banner -->
+    <div id="cloneBanner">
+      <span style="font-size: 1.4rem;">⚠️</span>
+      VOICE CLONING DETECTED — Session Terminated
+    </div>
+
     <!-- Header -->
     <header>
       <div class="logo-group">
@@ -552,12 +586,12 @@
               <div class="metric-value" id="metricRaw">—</div>
             </div>
             <div class="metric-box">
-              <div class="metric-label">P(Vocoder)</div>
-              <div class="metric-value" id="metricVocoder">—</div>
+              <div class="metric-label">Speaker Sim</div>
+              <div class="metric-value" id="metricSim">—</div>
             </div>
             <div class="metric-box">
-              <div class="metric-label">P(Prosody)</div>
-              <div class="metric-value" id="metricProsody">—</div>
+              <div class="metric-label">Loss Ratio</div>
+              <div class="metric-value" id="metricLossRatio">—</div>
             </div>
             <div class="metric-box">
               <div class="metric-label">Latency</div>
@@ -620,8 +654,10 @@
     const $audioSource  = document.getElementById('audioSource');
     const $metricEma    = document.getElementById('metricEma');
     const $metricRaw    = document.getElementById('metricRaw');
-    const $metricVocoder = document.getElementById('metricVocoder');
-    const $metricProsody = document.getElementById('metricProsody');
+    const $metricSim    = document.getElementById('metricSim') || document.getElementById('metricVocoder');
+    const $metricLossRatio = document.getElementById('metricLossRatio') || document.getElementById('metricProsody');
+    const $metricVocoder = $metricSim;
+    const $metricProsody = $metricLossRatio;
     const $metricLatency = document.getElementById('metricLatency');
     const $metricLoss   = document.getElementById('metricLoss');
     const $waveCanvas   = document.getElementById('waveformCanvas');
@@ -662,9 +698,23 @@
     }
 
     // ===== WebSocket =====
-    function connectWS() {
+    let reconnectTimer = null;
+
+    async function connectWS() {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/stream-verify`);
+      let token = '';
+      try {
+        const resp = await fetch('/dev/token?sub=dashboard-user');
+        if (resp.ok) {
+          const json = await resp.json();
+          token = json.token || '';
+        }
+      } catch (e) {}
+
+      const url = `${proto}://${location.host}/ws/stream-verify${token ? '?token=' + encodeURIComponent(token) : ''}`;
+      ws = new WebSocket(url);
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
@@ -676,8 +726,12 @@
       };
 
       ws.onmessage = (evt) => {
-        const data = JSON.parse(evt.data);
-        handleServerEvent(data);
+        try {
+          const data = JSON.parse(evt.data);
+          handleServerEvent(data);
+        } catch (e) {
+          console.error('Failed to parse WS message:', e);
+        }
       };
 
       ws.onclose = () => {
@@ -687,6 +741,10 @@
         $headerBadge.style.borderColor = 'var(--border)';
         addEvent('system', 'WebSocket closed');
         ws = null;
+        if (!isStreaming) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(connectWS, 3000);
+        }
       };
 
       ws.onerror = (err) => {
@@ -695,36 +753,79 @@
     }
 
     function handleServerEvent(data) {
+      if (!data || !data.event) return;
+
       if (data.event === 'session_started') {
-        $sessionId.textContent = data.session_id.slice(0, 8) + '…';
-        $sessionId.title = data.session_id;
+        if (data.session_id) {
+          $sessionId.textContent = data.session_id.slice(0, 8) + '…';
+          $sessionId.title = data.session_id;
+        }
         $modelInfo.textContent = data.using_model_fallback ? 'DSP Heuristic' : 'ONNX Model';
         $sessionStatus.innerHTML = '<span class="status-dot connected"></span>Active';
-        addEvent('session_started', `Session ${data.session_id.slice(0,8)}… | Model: ${data.using_model_fallback ? 'fallback heuristic' : 'ONNX'}`);
+        addEvent('session_started', `Session ${(data.session_id || '').slice(0,8)}… | Model: ${data.using_model_fallback ? 'fallback heuristic' : 'ONNX'}`);
       }
       else if (data.event === 'risk_update') {
         strideNum++;
         $strideCount.textContent = strideNum;
-        setGauge(data.composite_ema, data.risk_level);
+        if (data.session_id && ($sessionId.textContent === '—' || !$sessionId.textContent)) {
+          $sessionId.textContent = data.session_id.slice(0, 8) + '…';
+          $sessionId.title = data.session_id;
+          $sessionStatus.innerHTML = '<span class="status-dot connected"></span>Active';
+        }
+        setGauge(data.composite_ema ?? data.risk_score ?? 0, data.risk_level || 'SAFE');
 
-        $metricEma.textContent = data.composite_ema.toFixed(4);
-        $metricRaw.textContent = data.composite_raw.toFixed(4);
-        $metricVocoder.textContent = data.p_vocoder.toFixed(4);
-        $metricProsody.textContent = data.p_prosody.toFixed(4);
-        $metricLatency.textContent = data.latency_ms.toFixed(1) + 'ms';
-        $metricLoss.textContent = data.packet_loss_flagged ? '⚠ YES' : '✓ No';
-        $metricLoss.style.color = data.packet_loss_flagged ? 'var(--warning)' : 'var(--safe)';
+        $metricEma.textContent = (data.composite_ema != null) ? data.composite_ema.toFixed(4) : ((data.risk_score != null) ? data.risk_score.toFixed(4) : '—');
+        $metricRaw.textContent = (data.composite_raw != null) ? data.composite_raw.toFixed(4) : '—';
+        
+        const simVal = (data.speaker_similarity != null)
+          ? data.speaker_similarity.toFixed(4)
+          : (data.p_identity != null ? (1.0 - data.p_identity).toFixed(4) : (data.p_vocoder != null ? data.p_vocoder.toFixed(4) : '—'));
+        $metricSim.textContent = simVal;
 
-        addEvent('risk_update', `ema=${data.composite_ema.toFixed(3)} raw=${data.composite_raw.toFixed(3)} risk=${data.risk_level} latency=${data.latency_ms.toFixed(1)}ms`);
+        const lossRatioVal = (data.packet_loss_ratio != null)
+          ? (data.packet_loss_ratio * 100).toFixed(1) + '%'
+          : (data.p_prosody != null ? data.p_prosody.toFixed(4) : '0.0%');
+        $metricLossRatio.textContent = lossRatioVal;
+
+        const latencyVal = (data.processing_latency_ms != null)
+          ? data.processing_latency_ms.toFixed(1) + 'ms'
+          : ((data.latency_ms != null) ? data.latency_ms.toFixed(1) + 'ms' : '0.0ms');
+        $metricLatency.textContent = latencyVal;
+
+        const hasLoss = data.packet_loss ?? data.packet_loss_flagged ?? false;
+        $metricLoss.textContent = hasLoss ? '⚠ YES' : '✓ No';
+        $metricLoss.style.color = hasLoss ? 'var(--warning)' : 'var(--safe)';
+
+        const logLatency = (data.processing_latency_ms != null)
+          ? data.processing_latency_ms.toFixed(1)
+          : ((data.latency_ms != null) ? data.latency_ms.toFixed(1) : '0.0');
+        const emaStr = (data.composite_ema != null) ? data.composite_ema.toFixed(3) : '0.000';
+        const rawStr = (data.composite_raw != null) ? data.composite_raw.toFixed(3) : '0.000';
+        addEvent('risk_update', `ema=${emaStr} raw=${rawStr} risk=${data.risk_level || 'SAFE'} latency=${logLatency}ms`);
       }
       else if (data.event === 'liveness_challenge') {
-        addEvent('liveness_challenge', `🔔 "${data.prompt_text}" (expires in ${data.expires_in_ms / 1000}s)`);
-      }
-      else if (data.event === 'liveness_result') {
-        addEvent('liveness_result', `Outcome: ${data.outcome}`);
+        addEvent('liveness_challenge', `🔔 "${data.prompt_text}" (expires in ${(data.expires_in_ms || 8000) / 1000}s)`);
       }
       else if (data.event === 'enforcement_action') {
-        addEvent('enforcement_action', `🚨 Action: ${data.action} | Score: ${data.risk_score.toFixed(3)}`);
+        const scoreStr = (data.risk_score != null) ? data.risk_score.toFixed(3) : '—';
+        addEvent('enforcement_action', `🚨 Action: ${data.action} | Score: ${scoreStr}`);
+        if (data.action === 'SEVER_SESSION') {
+          const banner = document.getElementById('cloneBanner');
+          if (banner) {
+            banner.style.display = 'flex';
+            banner.classList.add('banner-shake');
+          }
+        }
+      }
+      else if (data.event === 'mitigation_verdict') {
+        addEvent('mitigation_verdict', `Verdict: ${data.mitigation_action} (Window ${data.window_index})`);
+        if (data.mitigation_action === 'BLOCK' || data.risk_level === 'CRITICAL') {
+          const banner = document.getElementById('cloneBanner');
+          if (banner) {
+            banner.style.display = 'flex';
+            banner.classList.add('banner-shake');
+          }
+        }
       }
     }
 
@@ -942,6 +1043,7 @@
     // ===== Init =====
     window.addEventListener('DOMContentLoaded', () => {
       initWaveform();
+      connectWS();
     });
     window.addEventListener('resize', initWaveform);
   </script>
